@@ -12,13 +12,12 @@ import serial.tools.list_ports
 
 SERIAL_BAUDRATE = 115200
 
-# Przykład: "Received! #12 | Temp: 24.51 | Humidity: 45.22 | Pressure: 1008.33 hPa"
-TELEMETRY_REGEX = re.compile(
-    r"Received!\s*#(?P<counter>\d+)\s*\|\s*"
-    r"Temp:\s*(?P<temp>-?\d+(?:\.\d+)?)\s*\|\s*"
-    r"Humidity:\s*(?P<humi>-?\d+(?:\.\d+)?)\s*\|\s*"
-    r"Pressure:\s*(?P<pressure>-?\d+(?:\.\d+)?)\s*hPa"
-)
+TELEMETRY_REGEX = {
+    'counter': re.compile(r"Sent\s+packet:\s*(\d+)"),
+    'temp': re.compile(r"Temp:\s*(-?\d+(?:\.\d+)?)"),
+    'humi': re.compile(r"Humidity:\s*(-?\d+(?:\.\d+)?)"),
+    'pressure': re.compile(r"Pressure:\s*(-?\d+(?:\.\d+)?)")
+}
 
 
 class ESP32TelemetryGUI:
@@ -83,7 +82,7 @@ class ESP32TelemetryGUI:
         ttk.Label(controls, text="ESP32 video URL:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
 
         self.video_url_entry = ttk.Entry(controls, width=35)
-        self.video_url_entry.insert(0, "http://192.168.1.100/")
+        self.video_url_entry.insert(0, "http://192.168.14/")
         self.video_url_entry.grid(row=1, column=1, columnspan=2, sticky="we", padx=5, pady=5)
 
         self.video_button = ttk.Button(
@@ -174,8 +173,7 @@ class ESP32TelemetryGUI:
             thread = threading.Thread(target=self.serial_worker, daemon=True)
             thread.start()
 
-            thread = threading.Thread(target=self.serial_worker_sim, daemon=True)
-            thread.start()
+            # ZMIANA 2: Usunięto linie, które odpalały tutaj thread od "serial_worker_sim"
             
         except Exception as e:
             messagebox.showerror("Serial error", str(e))
@@ -215,9 +213,9 @@ class ESP32TelemetryGUI:
             counter = 0
             while self.serial_running:
                 counter += 1
-                temp = random.uniform(20, 30)      # przykładowa temperatura
-                humi = random.uniform(40, 60)      # wilgotność
-                pressure = random.uniform(990, 1020)  # ciśnienie hPa
+                temp = random.uniform(20, 30)      
+                humi = random.uniform(40, 60)      
+                pressure = random.uniform(990, 1020)  
                 line = f"Received! #{counter} | Temp: {temp:.2f} | Humidity: {humi:.2f} | Pressure: {pressure:.2f} hPa"
         
                 self.root.after(0, self.add_log, line)
@@ -225,23 +223,27 @@ class ESP32TelemetryGUI:
                 time.sleep(2)
 
     def parse_telemetry(self, line):
-        match = TELEMETRY_REGEX.search(line)
+        c_match = TELEMETRY_REGEX['counter'].search(line)
+        t_match = TELEMETRY_REGEX['temp'].search(line)
+        h_match = TELEMETRY_REGEX['humi'].search(line)
+        p_match = TELEMETRY_REGEX['pressure'].search(line)
 
-        if not match:
-            return
-
-        temp = float(match.group("temp"))
-        humi = float(match.group("humi"))
-        pressure = float(match.group("pressure"))
-        counter = int(match.group("counter"))
+        counter = int(c_match.group(1)) if c_match else None
+        temp = float(t_match.group(1)) if t_match else None
+        humi = float(h_match.group(1)) if h_match else None
+        pressure = float(p_match.group(1)) if p_match else None
 
         self.root.after(0, self.update_telemetry, temp, humi, pressure, counter)
 
     def update_telemetry(self, temp, humi, pressure, counter):
-        self.temp_var.set(f"{temp:.2f} °C")
-        self.humi_var.set(f"{humi:.2f} %")
-        self.pressure_var.set(f"{pressure:.2f} hPa")
-        self.counter_var.set(f"#{counter}")
+        if temp is not None:
+            self.temp_var.set(f"{temp:.2f} °C")
+        if humi is not None:
+            self.humi_var.set(f"{humi:.2f} %")
+        if pressure is not None:
+            self.pressure_var.set(f"{pressure:.2f} hPa")
+        if counter is not None:
+            self.counter_var.set(f"#{counter}")
 
     def add_log(self, text):
         self.log_text.insert(tk.END, text + "\n")
