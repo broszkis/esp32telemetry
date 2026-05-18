@@ -12,8 +12,8 @@
 #include <RF24.h>
 
 //Network Configuration
-const char* WIFI_SSID = "Orange_Internet_7EE0";
-const char* WIFI_PASS = "9cTvTv6NQZbzQG6zx5";
+const char* WIFI_SSID = "ssid";
+const char* WIFI_PASS = "password";
 
 //Camera Pins (ESP32-WROVER-KIT)
 constexpr int CAM_PIN_PWDN   = -1;
