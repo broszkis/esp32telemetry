@@ -110,8 +110,9 @@ void initCamera() {
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_VGA;
-    config.jpeg_quality = 12;
-    config.fb_count     = 1;
+    config.jpeg_quality = 20;
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (esp_camera_init(&config) != ESP_OK) {
         Serial.println("Camera initalization error");
@@ -128,6 +129,7 @@ void startCameraServer() {
     if (httpd_start(&stream_httpd, &server_config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
         Serial.println("HTTP streaming server started");
+        Serial.println(WiFi.localIP());
     }
 }
 

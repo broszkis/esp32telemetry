@@ -1,24 +1,18 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading
-import time
-import re
+from datetime import datetime
 
-import cv2
-from PIL import Image, ImageTk
-import serial
 import serial.tools.list_ports
+from PIL import Image, ImageTk
 
-
-SERIAL_BAUDRATE = 115200
-
-TELEMETRY_REGEX = {
-    'counter': re.compile(r"Sent\s+packet:\s*(\d+)"),
-    'temp': re.compile(r"Temp:\s*(-?\d+(?:\.\d+)?)"),
-    'humi': re.compile(r"Humidity:\s*(-?\d+(?:\.\d+)?)"),
-    'pressure': re.compile(r"Pressure:\s*(-?\d+(?:\.\d+)?)")
-}
-
+from config import (
+    SERIAL_BAUDRATE,
+    LOG_FILE_NAME,
+    SAVE_EVERY_N_PACKETS,
+    DEFAULT_VIDEO_URL
+)
+from telemetry_utils import parse_telemetry_line
+from workers import SerialReceiver, TelemetryLogger, VideoReceiver
 
 class ESP32TelemetryGUI:
     def __init__(self, root):
@@ -27,25 +21,34 @@ class ESP32TelemetryGUI:
         self.root.geometry("1100x720")
         self.root.minsize(900, 600)
 
-        self.serial_conn = None
-        self.video_capture = None
+        self.serial_receiver = None
+        self.video_receiver = None
 
-        self.serial_running = False
-        self.video_running = False
+        self.logger = TelemetryLogger(
+            file_name=LOG_FILE_NAME,
+            error_callback=self.thread_safe_log
+        )
 
+        self.received_packet_count = 0
         self.latest_frame = None
 
         self.temp_var = tk.StringVar(value="-- °C")
         self.humi_var = tk.StringVar(value="-- %")
         self.pressure_var = tk.StringVar(value="-- hPa")
         self.counter_var = tk.StringVar(value="#--")
+
         self.serial_status_var = tk.StringVar(value="Serial: disconnected")
         self.video_status_var = tk.StringVar(value="Video: disconnected")
+        self.logging_status_var = tk.StringVar(value="Logging: stopped")
 
         self.create_widgets()
         self.refresh_serial_ports()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ------------------------------------------------------------
+    # GUI
+    # ------------------------------------------------------------
 
     def create_widgets(self):
         main = ttk.Frame(self.root, padding=10)
@@ -61,7 +64,9 @@ class ESP32TelemetryGUI:
         controls = ttk.LabelFrame(main, text="Connection settings", padding=10)
         controls.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(controls, text="Receiver COM port:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(controls, text="Receiver COM port:").grid(
+            row=0, column=0, sticky="w", padx=5, pady=5
+        )
 
         self.port_combo = ttk.Combobox(controls, width=18, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", padx=5, pady=5)
@@ -79,11 +84,15 @@ class ESP32TelemetryGUI:
         )
         self.serial_button.grid(row=0, column=3, sticky="w", padx=5, pady=5)
 
-        ttk.Label(controls, text="ESP32 video URL:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(controls, text="ESP32 video URL:").grid(
+            row=1, column=0, sticky="w", padx=5, pady=5
+        )
 
         self.video_url_entry = ttk.Entry(controls, width=35)
-        self.video_url_entry.insert(0, "http://192.168.14/")
-        self.video_url_entry.grid(row=1, column=1, columnspan=2, sticky="we", padx=5, pady=5)
+        self.video_url_entry.insert(0, DEFAULT_VIDEO_URL)
+        self.video_url_entry.grid(
+            row=1, column=1, columnspan=2, sticky="we", padx=5, pady=5
+        )
 
         self.video_button = ttk.Button(
             controls,
@@ -97,8 +106,15 @@ class ESP32TelemetryGUI:
         status_frame = ttk.Frame(main)
         status_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(status_frame, textvariable=self.serial_status_var).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Label(status_frame, textvariable=self.video_status_var).pack(side=tk.LEFT)
+        ttk.Label(status_frame, textvariable=self.serial_status_var).pack(
+            side=tk.LEFT, padx=(0, 20)
+        )
+        ttk.Label(status_frame, textvariable=self.video_status_var).pack(
+            side=tk.LEFT, padx=(0, 20)
+        )
+        ttk.Label(status_frame, textvariable=self.logging_status_var).pack(
+            side=tk.LEFT
+        )
 
         content = ttk.Frame(main)
         content.pack(fill=tk.BOTH, expand=True)
@@ -106,7 +122,7 @@ class ESP32TelemetryGUI:
         video_frame = ttk.LabelFrame(content, text="Live video stream", padding=10)
         video_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        self.video_label = ttk.Label(video_frame, text="No video", anchor="center")
+        self.video_label = ttk.Label(video_frame, text="No video", anchor="center", width=90)
         self.video_label.pack(fill=tk.BOTH, expand=True)
 
         telemetry_frame = ttk.LabelFrame(content, text="Telemetry", padding=15)
@@ -138,6 +154,26 @@ class ESP32TelemetryGUI:
         value = ttk.Label(frame, textvariable=variable, font=("Segoe UI", 22, "bold"))
         value.pack(anchor="w")
 
+    # ------------------------------------------------------------
+    # THREAD-SAFE CALLBACKS
+    # ------------------------------------------------------------
+
+    def thread_safe_log(self, text):
+        self.root.after(0, self.add_log, text)
+
+    def thread_safe_video_status(self, text):
+        self.root.after(0, self.video_status_var.set, text)
+
+    def thread_safe_line_received(self, line):
+        self.root.after(0, self.handle_telemetry_line, line)
+
+    def thread_safe_frame_received(self, frame):
+        self.root.after(0, self.update_video_frame, frame)
+
+    # ------------------------------------------------------------
+    # SERIAL PORTS
+    # ------------------------------------------------------------
+
     def refresh_serial_ports(self):
         ports = list(serial.tools.list_ports.comports())
         port_names = [port.device for port in ports]
@@ -149,8 +185,12 @@ class ESP32TelemetryGUI:
         else:
             self.port_combo.set("")
 
+    # ------------------------------------------------------------
+    # SERIAL
+    # ------------------------------------------------------------
+
     def toggle_serial(self):
-        if self.serial_running:
+        if self.serial_receiver and self.serial_receiver.running:
             self.stop_serial()
         else:
             self.start_serial()
@@ -163,85 +203,74 @@ class ESP32TelemetryGUI:
             return
 
         try:
-            self.serial_conn = serial.Serial(port, SERIAL_BAUDRATE, timeout=1)
-            time.sleep(2)
+            self.serial_receiver = SerialReceiver(
+                baudrate=SERIAL_BAUDRATE,
+                line_callback=self.thread_safe_line_received,
+                error_callback=self.thread_safe_log
+            )
 
-            self.serial_running = True
+            self.serial_receiver.start(port)
+
+            self.start_logger()
+
             self.serial_button.configure(text="Disconnect Serial")
             self.serial_status_var.set(f"Serial: connected to {port}")
 
-            thread = threading.Thread(target=self.serial_worker, daemon=True)
-            thread.start()
-
-            # ZMIANA 2: Usunięto linie, które odpalały tutaj thread od "serial_worker_sim"
-            
         except Exception as e:
             messagebox.showerror("Serial error", str(e))
             self.serial_status_var.set("Serial: connection failed")
 
     def stop_serial(self):
-        self.serial_running = False
+        if self.serial_receiver:
+            self.serial_receiver.stop()
+
         self.serial_button.configure(text="Connect Serial")
         self.serial_status_var.set("Serial: disconnected")
+        self.stop_logger()
 
-        try:
-            if self.serial_conn and self.serial_conn.is_open:
-                self.serial_conn.close()
-        except Exception:
-            pass
+    # ------------------------------------------------------------
+    # TELEMETRY
+    # ------------------------------------------------------------
 
-        self.serial_conn = None
+    def handle_telemetry_line(self, line):
+        self.add_log(line)
 
-    def serial_worker(self):
-        while self.serial_running:
-            try:
-                if self.serial_conn and self.serial_conn.is_open:
-                    line = self.serial_conn.readline().decode(errors="ignore").strip()
+        data = parse_telemetry_line(line)
 
-                    if line:
-                        self.root.after(0, self.add_log, line)
-                        self.parse_telemetry(line)
+        self.update_telemetry(
+            data["temp"],
+            data["humi"],
+            data["pressure"],
+            data["counter"]
+        )
 
-            except Exception as e:
-                self.root.after(0, self.add_log, f"Serial error: {e}")
-                self.root.after(0, self.stop_serial)
-                break
-    import random
-    import time
+        if data["temp"] is None or data["humi"] is None or data["pressure"] is None:
+            return
 
-    def serial_worker_sim(self):
-            counter = 0
-            while self.serial_running:
-                counter += 1
-                temp = random.uniform(20, 30)      
-                humi = random.uniform(40, 60)      
-                pressure = random.uniform(990, 1020)  
-                line = f"Received! #{counter} | Temp: {temp:.2f} | Humidity: {humi:.2f} | Pressure: {pressure:.2f} hPa"
-        
-                self.root.after(0, self.add_log, line)
-                self.parse_telemetry(line)
-                time.sleep(2)
+        self.received_packet_count += 1
 
-    def parse_telemetry(self, line):
-        c_match = TELEMETRY_REGEX['counter'].search(line)
-        t_match = TELEMETRY_REGEX['temp'].search(line)
-        h_match = TELEMETRY_REGEX['humi'].search(line)
-        p_match = TELEMETRY_REGEX['pressure'].search(line)
+        if self.received_packet_count % SAVE_EVERY_N_PACKETS == 0:
+            log_data = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "counter": data["counter"] if data["counter"] is not None else self.received_packet_count,
+                "temp": data["temp"],
+                "humi": data["humi"],
+                "pressure": data["pressure"]
+            }
 
-        counter = int(c_match.group(1)) if c_match else None
-        temp = float(t_match.group(1)) if t_match else None
-        humi = float(h_match.group(1)) if h_match else None
-        pressure = float(p_match.group(1)) if p_match else None
-
-        self.root.after(0, self.update_telemetry, temp, humi, pressure, counter)
+            self.logger.put(log_data)
+            self.add_log(f"Saved packet #{log_data['counter']} to {LOG_FILE_NAME}")
 
     def update_telemetry(self, temp, humi, pressure, counter):
         if temp is not None:
             self.temp_var.set(f"{temp:.2f} °C")
+
         if humi is not None:
             self.humi_var.set(f"{humi:.2f} %")
+
         if pressure is not None:
             self.pressure_var.set(f"{pressure:.2f} hPa")
+
         if counter is not None:
             self.counter_var.set(f"#{counter}")
 
@@ -249,8 +278,24 @@ class ESP32TelemetryGUI:
         self.log_text.insert(tk.END, text + "\n")
         self.log_text.see(tk.END)
 
+    # ------------------------------------------------------------
+    # LOGGER
+    # ------------------------------------------------------------
+
+    def start_logger(self):
+        self.logger.start()
+        self.logging_status_var.set(f"Logging: active, every {SAVE_EVERY_N_PACKETS} packets")
+
+    def stop_logger(self):
+        self.logger.stop()
+        self.logging_status_var.set("Logging: stopped")
+
+    # ------------------------------------------------------------
+    # VIDEO
+    # ------------------------------------------------------------
+
     def toggle_video(self):
-        if self.video_running:
+        if self.video_receiver and self.video_receiver.running:
             self.stop_video()
         else:
             self.start_video()
@@ -262,78 +307,52 @@ class ESP32TelemetryGUI:
             messagebox.showerror("Video error", "Enter ESP32 video URL first.")
             return
 
-        self.video_running = True
-        self.video_button.configure(text="Disconnect Video")
-        self.video_status_var.set(f"Video: connecting to {url}")
+        self.video_receiver = VideoReceiver(
+            frame_callback=self.thread_safe_frame_received,
+            status_callback=self.thread_safe_video_status,
+            error_callback=self.thread_safe_log
+        )
 
-        thread = threading.Thread(target=self.video_worker, args=(url,), daemon=True)
-        thread.start()
+        self.video_receiver.start(url)
+
+        self.video_button.configure(text="Disconnect Video")
 
     def stop_video(self):
-        self.video_running = False
+        if self.video_receiver:
+            self.video_receiver.stop()
+
         self.video_button.configure(text="Connect Video")
         self.video_status_var.set("Video: disconnected")
-
-        try:
-            if self.video_capture:
-                self.video_capture.release()
-        except Exception:
-            pass
-
-        self.video_capture = None
         self.video_label.configure(image="", text="No video")
 
-    def video_worker(self, url):
-        try:
-            self.video_capture = cv2.VideoCapture(url)
+    def update_video_frame(self, frame):
+        target_width = 640
+        target_height = 480
 
-            if not self.video_capture.isOpened():
-                self.root.after(0, self.video_status_var.set, "Video: connection failed")
-                self.root.after(0, self.stop_video)
-                return
+        frame_height, frame_width, _ = frame.shape
 
-            self.root.after(0, self.video_status_var.set, "Video: connected")
+        scale = min(
+            target_width / frame_width,
+            target_height / frame_height
+        )
 
-            while self.video_running:
-                ret, frame = self.video_capture.read()
+        new_width = int(frame_width * scale)
+        new_height = int(frame_height * scale)
 
-                if not ret:
-                    time.sleep(0.1)
-                    continue
+        image = Image.fromarray(frame)
+        image = image.resize((new_width, new_height))
 
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(image=image)
 
-                label_width = max(self.video_label.winfo_width(), 640)
-                label_height = max(self.video_label.winfo_height(), 480)
-
-                frame_height, frame_width, _ = frame.shape
-                scale = min(label_width / frame_width, label_height / frame_height)
-
-                new_width = int(frame_width * scale)
-                new_height = int(frame_height * scale)
-
-                frame = cv2.resize(frame, (new_width, new_height))
-
-                image = Image.fromarray(frame)
-                photo = ImageTk.PhotoImage(image=image)
-
-                self.root.after(0, self.update_video_frame, photo)
-
-        except Exception as e:
-            self.root.after(0, self.video_status_var.set, f"Video error: {e}")
-            self.root.after(0, self.stop_video)
-
-    def update_video_frame(self, photo):
         self.latest_frame = photo
         self.video_label.configure(image=self.latest_frame, text="")
 
+    # ------------------------------------------------------------
+    # CLOSE
+    # ------------------------------------------------------------
+
     def on_close(self):
         self.stop_serial()
+        self.stop_logger()
         self.stop_video()
         self.root.destroy()
-
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = ESP32TelemetryGUI(root)
-    root.mainloop()
