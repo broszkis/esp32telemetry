@@ -12,8 +12,8 @@
 #include <RF24.h>
 
 //Network Configuration
-const char* WIFI_SSID = "ssid";
-const char* WIFI_PASS = "password";
+const char* WIFI_SSID = "xxx";
+const char* WIFI_PASS = "xxx";
 
 //Camera Pins (ESP32-WROVER-KIT)
 constexpr int CAM_PIN_PWDN   = -1;
@@ -107,10 +107,10 @@ void initCamera() {
     config.pin_pwdn     = CAM_PIN_PWDN;
     config.pin_reset    = CAM_PIN_RESET;
     
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = 8000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_VGA;
-    config.jpeg_quality = 20;
+    config.jpeg_quality = 36;
     config.fb_count     = 2;
     config.grab_mode    = CAMERA_GRAB_LATEST;
 

@@ -6,3 +6,8 @@ __pycache__/
 *.pyc
 venv/
 env/
+include/
+lib/
+test/
+telemetry_log.txt
+*.json
